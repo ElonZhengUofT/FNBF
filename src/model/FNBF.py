@@ -213,6 +213,7 @@ class FNBF(eqx.Module):
 
         phi_up_correction_grid = jax.vmap(correct_one_up)(phi_up_grid)   # (nup, Lx, Ly)
         phi_dn_correction_grid = jax.vmap(correct_one_dn)(phi_dn_grid)   # (ndn, Lx, Ly)
+        return self.single_forward_from_phi(phi_up_correction_grid, phi_dn_correction_grid, n)
 
         # back to (nsites, nup)/(nsites, ndn)
         phi_up_correction = phi_up_correction_grid.reshape(self.nup, self.nsites).T
@@ -260,3 +261,23 @@ if __name__ == "__main__":
         print(e)
         energy.append(e)
     print(energy.mean)
+
+    model_fnbf = FNBF(nsites=N, nup=7, ndn=7, Lx=4, Ly=4, key=jax.random.PRNGKey(0))
+    model_0 = state.model
+    model_fnbf = eqx.tree_at(lambda model: model.phi_up, model_fnbf, model_0.phi_up)
+    model_fnbf = eqx.tree_at(lambda model: model.phi_dn, model_fnbf, model_0.phi_dn)
+    model_fnbf = eqx.tree_at(lambda model: model.v, model_fnbf, model_0.v)
+    state_fnbf = qtx.state.Variational(model_fnbf, max_parallel=8192*45)
+    sampler_fnbf = qtx.sampler.ParticleHop(state_fnbf, 8192, sweep_steps=10 * N)
+    optimizer_fnbf = qtx.optimizer.SR(state_fnbf, H)
+
+    energy_fnbf = qtx.utils.DataTracer()
+
+    for i in range(500):
+        samples = sampler_fnbf.sweep()
+        step = optimizer_fnbf.get_step(samples)
+        state_fnbf.update(step * 0.05)
+        e = optimizer_fnbf.energy
+        print(e)
+        energy_fnbf.append(e)
+    print(energy_fnbf.mean)
