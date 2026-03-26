@@ -8,6 +8,23 @@ from quantax.utils import LogArray
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from pathlib import Path
+
+
+def _cast_floating_tree_to_dtype(tree, dtype):
+    return jax.tree_util.tree_map(
+        lambda x: x.astype(dtype)
+        if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating)
+        else x,
+        tree,
+    )
+
+
+def _zero_array_tree(tree):
+    return jax.tree_util.tree_map(
+        lambda x: jnp.zeros_like(x) if isinstance(x, jax.Array) else x,
+        tree,
+    )
 
 
 def init_params(nsites: int, nup: int, ndn: int, key):
@@ -97,6 +114,8 @@ class FNBF(eqx.Module):
     
     fno_up: ClassicFNO
     fno_dn: ClassicFNO
+    alpha_up: jax.Array
+    alpha_dn: jax.Array
 
     nsites: int = eqx.field(static=True)
     nup: int = eqx.field(static=True)
@@ -125,6 +144,9 @@ class FNBF(eqx.Module):
             )
         self.Lx = Lx
         self.Ly = Ly
+        # pdequinox uses rfft on the last spatial axis, so the effective
+        # maximum there is Ly//2 + 1.
+        fno_num_modes = min(Lx, Ly // 2 + 1)
 
         k_init, k_up, k_dn = jr.split(key, 3)
         self.phi_up, self.phi_dn, self.v = init_params(nsites, nup, ndn, k_init)
@@ -133,14 +155,32 @@ class FNBF(eqx.Module):
             num_spatial_dims=2,
             in_channels=3,
             out_channels=1,
+            hidden_channels=16,
+            num_modes=fno_num_modes,
             key=k_up,
         )
         self.fno_dn = ClassicFNO(
             num_spatial_dims=2,
             in_channels=3,
             out_channels=1,
+            hidden_channels=16,
+            num_modes=fno_num_modes,
             key=k_dn,
         )
+        self.fno_up = _cast_floating_tree_to_dtype(self.fno_up, self.phi_up.dtype)
+        self.fno_dn = _cast_floating_tree_to_dtype(self.fno_dn, self.phi_up.dtype)
+        self.fno_up = eqx.tree_at(
+            lambda m: m.projection,
+            self.fno_up,
+            _zero_array_tree(self.fno_up.projection),
+        )
+        self.fno_dn = eqx.tree_at(
+            lambda m: m.projection,
+            self.fno_dn,
+            _zero_array_tree(self.fno_dn.projection),
+        )
+        self.alpha_up = jnp.array(0.0, dtype=self.phi_up.dtype)
+        self.alpha_dn = jnp.array(0.0, dtype=self.phi_up.dtype)
 
     def single_forward_from_phi(
         self, phi_up: jax.Array, phi_dn: jax.Array, n: jax.Array
@@ -190,7 +230,7 @@ class FNBF(eqx.Module):
                     f"fno_up output shape mismatch: expected {(1, self.Lx, self.Ly)}, "
                     f"got {delta_i.shape}"
                 )
-            return delta_i[0]   # (Lx, Ly)
+            return self.alpha_up * delta_i[0]   # (Lx, Ly)
 
         def correct_one_dn(phi_i):
             # phi_i: (Lx, Ly)
@@ -209,11 +249,10 @@ class FNBF(eqx.Module):
                     f"fno_dn output shape mismatch: expected {(1, self.Lx, self.Ly)}, "
                     f"got {delta_i.shape}"
                 )
-            return delta_i[0]   # (Lx, Ly)
+            return self.alpha_dn * delta_i[0]   # (Lx, Ly)
 
         phi_up_correction_grid = jax.vmap(correct_one_up)(phi_up_grid)   # (nup, Lx, Ly)
         phi_dn_correction_grid = jax.vmap(correct_one_dn)(phi_dn_grid)   # (ndn, Lx, Ly)
-        return self.single_forward_from_phi(phi_up_correction_grid, phi_dn_correction_grid, n)
 
         # back to (nsites, nup)/(nsites, ndn)
         phi_up_correction = phi_up_correction_grid.reshape(self.nup, self.nsites).T
@@ -234,50 +273,78 @@ class FNBF(eqx.Module):
             raise ValueError(f"Expected n.ndim in {{1,2}}, got {n.ndim}")
 
 if __name__ == "__main__":
-    FNO = ClassicFNO(
-        num_spatial_dims=2,
-        in_channels=2,
-        out_channels=1,
-        key=jax.random.PRNGKey(0),
-    )
+    base_nsamples = 8192
+    base_max_parallel = 8192 * 45
+    fnbf_nsamples = 8192
+    fnbf_max_parallel = 4096 * 45
+    nsteps = 500
+    slater_ckpt_path = Path("checkpoints/slater.eqx")
+    nsteps_slater = 500 if not slater_ckpt_path.exists() else 0
+
     lattice = qtx.sites.Square(
         4, particle_type=qtx.PARTICLE_TYPE.spinful_fermion, Nparticles=(7, 7)
     )
     N = lattice.Nsites
 
     H = qtx.operator.Hubbard(U=8)
-    JastrowSlater = JastrowSlater(nsites=N, nup=7, ndn=7, key=jax.random.PRNGKey(0))
-    state = qtx.state.Variational(JastrowSlater, max_parallel=8192*45)
-    sampler = qtx.sampler.ParticleHop(state, 8192, sweep_steps=10 * N)
+    slater_model = JastrowSlater(nsites=N, nup=7, ndn=7, key=jax.random.PRNGKey(0))
+    state = qtx.state.Variational(slater_model, max_parallel=base_max_parallel)
+    sampler = qtx.sampler.ParticleHop(state, base_nsamples, sweep_steps=10 * N)
     optimizer = qtx.optimizer.SR(state, H)
 
     energy = qtx.utils.DataTracer()
 
-    for i in range(500):
-        samples = sampler.sweep()
-        step = optimizer.get_step(samples)
-        state.update(step * 0.05)
-        e = optimizer.energy
+    if nsteps_slater > 0:
+        for i in range(nsteps_slater):
+            samples = sampler.sweep()
+            step = optimizer.get_step(samples)
+            state.update(step * 0.05)
+            e = optimizer.energy
+            print(e)
+            energy.append(e)
+        print(energy.mean())
+
+        # Save trained Slater/Jastrow model for FNBF injection.
+        slater_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        eqx.tree_serialise_leaves(slater_ckpt_path, state.model)
+    else:
+        print(f"Loading existing Slater checkpoint: {slater_ckpt_path}")
+
+    slater_loaded = eqx.tree_deserialise_leaves(
+        slater_ckpt_path,
+        JastrowSlater(nsites=N, nup=7, ndn=7, key=jax.random.PRNGKey(1234)),
+    )
+
+    state_slater = qtx.state.Variational(slater_loaded, max_parallel=base_max_parallel)
+    sampler_slater = qtx.sampler.ParticleHop(state_slater, base_nsamples, sweep_steps=10 * N)
+    optimizer_slater = qtx.optimizer.SR(state_slater, H)
+
+    energy_slater = qtx.utils.DataTracer()
+
+    for i in range(1):
+        samples = sampler_slater.sweep()
+        step = optimizer_slater.get_step(samples)
+        state_slater.update(step * 0.05)
+        e = optimizer_slater.energy
         print(e)
-        energy.append(e)
-    print(energy.mean)
+    print("====================")
 
     model_fnbf = FNBF(nsites=N, nup=7, ndn=7, Lx=4, Ly=4, key=jax.random.PRNGKey(0))
-    model_0 = state.model
-    model_fnbf = eqx.tree_at(lambda model: model.phi_up, model_fnbf, model_0.phi_up)
-    model_fnbf = eqx.tree_at(lambda model: model.phi_dn, model_fnbf, model_0.phi_dn)
-    model_fnbf = eqx.tree_at(lambda model: model.v, model_fnbf, model_0.v)
-    state_fnbf = qtx.state.Variational(model_fnbf, max_parallel=8192*45)
-    sampler_fnbf = qtx.sampler.ParticleHop(state_fnbf, 8192, sweep_steps=10 * N)
+    model_fnbf = eqx.tree_at(lambda model: model.phi_up, model_fnbf, slater_loaded.phi_up)
+    model_fnbf = eqx.tree_at(lambda model: model.phi_dn, model_fnbf, slater_loaded.phi_dn)
+    model_fnbf = eqx.tree_at(lambda model: model.v, model_fnbf, slater_loaded.v)
+    state_fnbf = qtx.state.Variational(model_fnbf, max_parallel=fnbf_max_parallel)
+    sampler_fnbf = qtx.sampler.ParticleHop(state_fnbf, fnbf_nsamples, sweep_steps=10 * N)
     optimizer_fnbf = qtx.optimizer.SR(state_fnbf, H)
 
     energy_fnbf = qtx.utils.DataTracer()
 
-    for i in range(500):
+    for i in range(nsteps):
         samples = sampler_fnbf.sweep()
         step = optimizer_fnbf.get_step(samples)
-        state_fnbf.update(step * 0.05)
+        lr = 0.1
+        state_fnbf.update(step * lr)
         e = optimizer_fnbf.energy
         print(e)
         energy_fnbf.append(e)
-    print(energy_fnbf.mean)
+    print(energy_fnbf.mean())
