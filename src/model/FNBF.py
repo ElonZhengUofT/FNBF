@@ -5,10 +5,22 @@ import pdequinox as pdeqx
 from pdequinox.arch import ClassicFNO
 import equinox as eqx
 from quantax.utils import LogArray
+from quantax.optimizer import auto_shift_eig
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import csv
+import time
 from pathlib import Path
+
+
+def scale_mlp_params(mlp: eqx.nn.MLP, scale: float) -> eqx.nn.MLP:
+    if scale == 1.0:
+        return mlp
+    return jax.tree_util.tree_map(
+        lambda x: x * scale if isinstance(x, jax.Array) else x,
+        mlp,
+    )
 
 
 def _cast_floating_tree_to_dtype(tree, dtype):
@@ -16,13 +28,6 @@ def _cast_floating_tree_to_dtype(tree, dtype):
         lambda x: x.astype(dtype)
         if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating)
         else x,
-        tree,
-    )
-
-
-def _zero_array_tree(tree):
-    return jax.tree_util.tree_map(
-        lambda x: jnp.zeros_like(x) if isinstance(x, jax.Array) else x,
         tree,
     )
 
@@ -114,8 +119,6 @@ class FNBF(eqx.Module):
     
     fno_up: ClassicFNO
     fno_dn: ClassicFNO
-    alpha_up: jax.Array
-    alpha_dn: jax.Array
 
     nsites: int = eqx.field(static=True)
     nup: int = eqx.field(static=True)
@@ -129,6 +132,7 @@ class FNBF(eqx.Module):
         ndn: int,
         Lx: int,
         Ly: int,
+        backflow_init_scale: float = 1e-3,
         key=None,
     ):
         if key is None:
@@ -172,15 +176,13 @@ class FNBF(eqx.Module):
         self.fno_up = eqx.tree_at(
             lambda m: m.projection,
             self.fno_up,
-            _zero_array_tree(self.fno_up.projection),
+            scale_mlp_params(self.fno_up.projection, backflow_init_scale),
         )
         self.fno_dn = eqx.tree_at(
             lambda m: m.projection,
             self.fno_dn,
-            _zero_array_tree(self.fno_dn.projection),
+            scale_mlp_params(self.fno_dn.projection, backflow_init_scale),
         )
-        self.alpha_up = jnp.array(0.0, dtype=self.phi_up.dtype)
-        self.alpha_dn = jnp.array(0.0, dtype=self.phi_up.dtype)
 
     def single_forward_from_phi(
         self, phi_up: jax.Array, phi_dn: jax.Array, n: jax.Array
@@ -230,7 +232,7 @@ class FNBF(eqx.Module):
                     f"fno_up output shape mismatch: expected {(1, self.Lx, self.Ly)}, "
                     f"got {delta_i.shape}"
                 )
-            return self.alpha_up * delta_i[0]   # (Lx, Ly)
+            return delta_i[0]   # (Lx, Ly)
 
         def correct_one_dn(phi_i):
             # phi_i: (Lx, Ly)
@@ -249,7 +251,7 @@ class FNBF(eqx.Module):
                     f"fno_dn output shape mismatch: expected {(1, self.Lx, self.Ly)}, "
                     f"got {delta_i.shape}"
                 )
-            return self.alpha_dn * delta_i[0]   # (Lx, Ly)
+            return delta_i[0]   # (Lx, Ly)
 
         phi_up_correction_grid = jax.vmap(correct_one_up)(phi_up_grid)   # (nup, Lx, Ly)
         phi_dn_correction_grid = jax.vmap(correct_one_dn)(phi_dn_grid)   # (ndn, Lx, Ly)
@@ -274,10 +276,10 @@ class FNBF(eqx.Module):
 
 if __name__ == "__main__":
     base_nsamples = 8192
-    base_max_parallel = 8192 * 45
-    fnbf_nsamples = 8192
+    base_max_parallel = 256
+    fnbf_nsamples = 4096
     fnbf_max_parallel = 4096 * 45
-    nsteps = 500
+    nsteps = 5000
     slater_ckpt_path = Path("checkpoints/slater.eqx")
     nsteps_slater = 500 if not slater_ckpt_path.exists() else 0
 
@@ -290,7 +292,7 @@ if __name__ == "__main__":
     slater_model = JastrowSlater(nsites=N, nup=7, ndn=7, key=jax.random.PRNGKey(0))
     state = qtx.state.Variational(slater_model, max_parallel=base_max_parallel)
     sampler = qtx.sampler.ParticleHop(state, base_nsamples, sweep_steps=10 * N)
-    optimizer = qtx.optimizer.SR(state, H)
+    optimizer = qtx.optimizer.AdamSR(state, H)
 
     energy = qtx.utils.DataTracer()
 
@@ -316,8 +318,8 @@ if __name__ == "__main__":
     )
 
     state_slater = qtx.state.Variational(slater_loaded, max_parallel=base_max_parallel)
-    sampler_slater = qtx.sampler.ParticleHop(state_slater, base_nsamples, sweep_steps=10 * N)
-    optimizer_slater = qtx.optimizer.SR(state_slater, H)
+    sampler_slater = qtx.sampler.ParticleHop(state_slater, base_nsamples, sweep_steps=int(2.5 * N))
+    optimizer_slater = qtx.optimizer.AdamSR(state_slater, H, solver=auto_shift_eig(ashift=1e-3))
 
     energy_slater = qtx.utils.DataTracer()
 
@@ -338,13 +340,32 @@ if __name__ == "__main__":
     optimizer_fnbf = qtx.optimizer.SR(state_fnbf, H)
 
     energy_fnbf = qtx.utils.DataTracer()
+    fnbf_log_path = Path("training_log_fnbf.csv")
+    train_start = time.perf_counter()
+    with fnbf_log_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["step", "energy", "var", "elapsed_s"])
 
     for i in range(nsteps):
         samples = sampler_fnbf.sweep()
         step = optimizer_fnbf.get_step(samples)
-        lr = 0.1
+        lr = 0.003
+        lr = lr / (1 + i / 1e4)
+        if i < 10:
+            lr = 1e-3
         state_fnbf.update(step * lr)
         e = optimizer_fnbf.energy
-        print(e)
+        var_e = getattr(optimizer_fnbf, "VarE", None)
+        var_e_val = float(var_e) if var_e is not None else float("nan")
+        elapsed_s = time.perf_counter() - train_start
+        print(f"e={float(e):.8f} varE={var_e_val:.8f}")
         energy_fnbf.append(e)
+        with fnbf_log_path.open("a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([i, float(e), var_e_val, elapsed_s])
     print(energy_fnbf.mean())
+
+    fnbf_ckpt_path = Path("checkpoints/fnbf.eqx")
+    fnbf_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    eqx.tree_serialise_leaves(fnbf_ckpt_path, state_fnbf.model)
+    print(f"Saved FNBF checkpoint to: {fnbf_ckpt_path}")
