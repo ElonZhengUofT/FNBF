@@ -20,6 +20,7 @@ import equinox as eqx
 from quantax.nn import fermion_idx
 from quantax.utils import LogArray
 from quantax.optimizer.solver import auto_shift_eig
+from src.optimizers.Adam import AdamQuantax
 
 def clip_tree_global_norm(tree, max_norm: float):
     leaves = [x for x in jax.tree_util.tree_leaves(tree) if isinstance(x, jax.Array)]
@@ -94,13 +95,29 @@ def main():
     sampler = qtx.sampler.ParticleHop(state, 2048, sweep_steps=10 * nsites)
     optimizer = qtx.optimizer.AdamSR(state, H)
     energy = qtx.utils.DataTracer()
-    for i in range(1000):
-        samples = sampler.sweep()
-        step = optimizer.get_step(samples)
-        state.update(step * 0.05)
-        e = optimizer.energy
-        print(e)
-        energy.append(e)
+    energy_csv_path = os.path.join(
+        root_dir, f"logs/transfer8x8_energy.csv"
+    )
+    os.makedirs(os.path.dirname(energy_csv_path), exist_ok=True)
+    lr_init = 0.05
+    train_start = time.time()
+    with open(energy_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["step", "energy", "VarE", "iter_time", "elapsed_s", "lr"])
+        for i in range(1000):
+            iter_start = time.time()
+            lr = lr_init / (1 + i / 1e3)
+            samples = sampler.sweep()
+            step = optimizer.get_step(samples)
+            state.update(step * lr)
+            e = optimizer.energy
+            var_e = getattr(optimizer, "VarE", getattr(optimizer, "variance", float("nan")))
+            iter_time = time.time() - iter_start
+            elapsed_s = time.time() - train_start
+            print(e)
+            energy.append(e)
+            writer.writerow([i, float(e), float(var_e), iter_time, elapsed_s, lr])
+    print(f"Energy log saved to: {energy_csv_path}")
     print(energy.mean())
 
 if __name__ == "__main__":
